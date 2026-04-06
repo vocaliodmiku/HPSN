@@ -363,28 +363,30 @@ class SubspaceInhibition(nn.Module):
     
     def rank_regularization(self, r_min: float = 5.0, r_max: float = 50.0) -> torch.Tensor:
         """
-        Effective rank regularization for P.
+        Effective rank regularization for P using participation ratio.
         Penalizes if effective rank is outside [r_min, r_max].
-        
-        Effective rank approximation: ||P||_* / ||P||_2
-        (nuclear norm / spectral norm)
+
+        erank(P) = tr(G)^2 / tr(G^2),  G = P^T P
+        Decomposition-free, fully differentiable, numerically stable.
         """
-        # SVD of P
-        S = torch.linalg.svdvals(self.P)
-        nuclear_norm = S.sum()
-        spectral_norm = S[0]
-        effective_rank = nuclear_norm / (spectral_norm + 1e-8)
-        
+        P = self.P.float()
+        gram = P.t() @ P
+        tr_G = gram.trace()
+        tr_G2 = (gram * gram).sum()  # tr(G^2) = ||G||_F^2
+        effective_rank = tr_G ** 2 / (tr_G2 + 1e-12)
+
         # Hinge loss: penalize only when outside bounds
         loss = (
-            F.relu(r_min - effective_rank) + 
+            F.relu(r_min - effective_rank) +
             F.relu(effective_rank - r_max)
         )
         return loss
-    
+
     @property
     def effective_rank(self) -> float:
         """Current effective rank of P (for monitoring)."""
         with torch.no_grad():
-            S = torch.linalg.svdvals(self.P)
-            return (S.sum() / (S[0] + 1e-8)).item()
+            gram = self.P.float().t() @ self.P.float()
+            tr_G = gram.trace()
+            tr_G2 = (gram * gram).sum()
+            return (tr_G ** 2 / (tr_G2 + 1e-12)).item()

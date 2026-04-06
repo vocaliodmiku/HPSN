@@ -163,7 +163,17 @@ class HPSNHubert(nn.Module):
         return_block_outputs: bool = False,   # for analysis / RSA
         bypass_novel: bool = False,           # skip novel modules (for pretrained baseline eval)
         rank_reg_weight: float = 0.01,
+        use_chunked: bool = False,            # dispatch to forward_chunked
     ):
+        # Dispatch to chunked forward if requested (allows DDP to see this call)
+        if use_chunked:
+            return self.forward_chunked(
+                input_values=input_values,
+                attention_mask=attention_mask,
+                labels=labels,
+                return_block_outputs=return_block_outputs,
+                rank_reg_weight=rank_reg_weight,
+            )
         """
         Args:
             input_values: Raw waveform, (B, T_audio), 16kHz

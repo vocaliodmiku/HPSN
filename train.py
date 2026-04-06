@@ -293,23 +293,25 @@ def train_stage(
             labels = batch["labels"].to(device)
             
             # Forward
-            with torch.cuda.amp.autocast(enabled=args.fp16):
+            with torch.amp.autocast('cuda', enabled=args.fp16):
                 m = model.module if hasattr(model, "module") else model
-                if m.vertical_attention_type in ("chunked", "chunked_per_token"):
-                    outputs = m.forward_chunked(
-                        input_values=input_values,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                        rank_reg_weight=args.rank_reg_weight,
-                    )
-                else:
-                    outputs = model(
-                        input_values=input_values,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                        rank_reg_weight=args.rank_reg_weight,
-                    )
+                use_chunked = m.vertical_attention_type in ("chunked", "chunked_per_token")
+                outputs = model(
+                    input_values=input_values,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    rank_reg_weight=args.rank_reg_weight,
+                    use_chunked=use_chunked,
+                )
                 loss = outputs["loss"] / args.accum_grad
+            
+            # NaN detection: skip backward + optimizer step if loss is NaN
+            if torch.isnan(loss):
+                if step < 10 or step % 100 == 0:
+                    log(f"WARNING: NaN loss at step {step}, skipping update", rank)
+                optimizer.zero_grad()
+                step += 1
+                continue
             
             # Backward
             if scaler is not None:
@@ -324,9 +326,17 @@ def train_stage(
                 if scaler is not None:
                     scaler.unscale_(optimizer)
                 
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), args.max_grad_norm,
                 )
+                
+                # Skip optimizer step if gradients are NaN
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    if step < 50 or step % 100 == 0:
+                        log(f"WARNING: NaN/Inf grad norm ({grad_norm:.4f}) at step {step}, skipping update", rank)
+                    optimizer.zero_grad()
+                    step += 1
+                    continue
                 
                 if scaler is not None:
                     scaler.step(optimizer)
