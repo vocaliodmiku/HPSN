@@ -409,6 +409,7 @@ class HPSNHubert(nn.Module):
         all_block_outputs = []  # list of lists, one per chunk
         all_chunk_attn = []
         current_cache = cache
+        _nan_debug = not hasattr(self, '_nan_debug_done')
 
         for chunk_idx in range(num_chunks):
             chunk_hidden = chunks[chunk_idx]
@@ -422,11 +423,19 @@ class HPSNHubert(nn.Module):
                 block_out = self._run_block(block, hidden, chunk_mask)
                 block_outputs_list.append(block_out)
 
+                if _nan_debug and torch.isnan(block_out).any():
+                    print(f"[NaN DEBUG] chunk={chunk_idx} block={block_idx} "
+                          f"_run_block output has NaN. hidden nan={torch.isnan(hidden).any()}, "
+                          f"mask={chunk_mask is not None}")
+
                 if block_idx < self.num_blocks - 1:
                     # Apply inhibition at the designated boundary
                     if block_idx == self.inhibition_boundary:
                         block_out = self.inhibition(block_out)
                         block_outputs_list[-1] = block_out
+                        if _nan_debug and torch.isnan(block_out).any():
+                            print(f"[NaN DEBUG] chunk={chunk_idx} block={block_idx} "
+                                  f"inhibition output has NaN")
 
                     # Vertical attention with top-down cache
                     hidden = self.vertical_attention[block_idx](
@@ -435,6 +444,10 @@ class HPSNHubert(nn.Module):
                         cached_block_outputs=current_cache,
                         block_idx=block_idx,
                     )
+                    if _nan_debug and torch.isnan(hidden).any():
+                        print(f"[NaN DEBUG] chunk={chunk_idx} block={block_idx} "
+                              f"vertical_attention output has NaN. "
+                              f"n_bu={len(block_outputs_list)} has_cache={current_cache is not None}")
                 else:
                     hidden = block_out
 
@@ -446,6 +459,11 @@ class HPSNHubert(nn.Module):
 
             chunk_final = self.final_dropout(chunk_final)
             chunk_logits = self.ctc_head(chunk_final)
+
+            if _nan_debug and torch.isnan(chunk_logits).any():
+                print(f"[NaN DEBUG] chunk={chunk_idx} logits have NaN. "
+                      f"hidden nan={torch.isnan(hidden).any()}")
+
             all_logits_chunks.append(chunk_logits)
 
             # Update cache: detach all block outputs for next chunk
@@ -484,6 +502,16 @@ class HPSNHubert(nn.Module):
             label_mask = labels >= 0
             label_lengths = label_mask.sum(-1)
             labels_for_ctc = labels.clamp(min=0)
+
+            if _nan_debug:
+                nan_logits = torch.isnan(logits).any()
+                print(f"[NaN DEBUG] logits nan={nan_logits} "
+                      f"logits shape={logits.shape} "
+                      f"input_lengths={input_lengths.tolist()} "
+                      f"label_lengths={label_lengths.tolist()}")
+                if (input_lengths < label_lengths).any():
+                    print(f"[NaN DEBUG] WARNING: input_lengths < label_lengths!")
+                self._nan_debug_done = True
 
             ctc_loss = nn.functional.ctc_loss(
                 log_probs, labels_for_ctc, input_lengths, label_lengths,
