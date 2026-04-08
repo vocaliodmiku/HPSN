@@ -44,7 +44,6 @@ def parse_args():
     
     # Model
     parser.add_argument("--pretrained", type=str, default="facebook/hubert-large-ls960-ft")
-    parser.add_argument("--query_dim", type=int, default=64)
     parser.add_argument("--inhibition_rank", type=int, default=64)
     parser.add_argument("--inhibition_boundary", type=int, default=2, 
                         help="Block boundary for inhibition (0=B1/B2, 2=B3/B4)")
