@@ -1,9 +1,8 @@
-"""
-HPSN Training Script
-====================
-Two-stage CTC fine-tuning of HuBERT-Large + Block AttnRes + Inhibition.
+"""HPSN Training Script (v2)
+===========================
+Two-stage CTC fine-tuning of HuBERT-Large + RefineLayer + Inhibition.
 
-Stage 1: Backbone frozen, train only novel modules (vertical attention,
+Stage 1: Backbone frozen, train only novel modules (refine layers,
          inhibition, CTC head). ~10K steps with higher LR.
 
 Stage 2: Everything unfrozen (except CNN), joint fine-tuning with
@@ -49,15 +48,8 @@ def parse_args():
     parser.add_argument("--inhibition_rank", type=int, default=64)
     parser.add_argument("--inhibition_boundary", type=int, default=2, 
                         help="Block boundary for inhibition (0=B1/B2, 2=B3/B4)")
-    parser.add_argument("--vertical_attention_type", type=str, default="standard",
-                        choices=["standard", "chunked", "chunked_per_token"],
-                        help="Vertical attention variant")
-    parser.add_argument("--chunk_size", type=int, default=16,
-                        help="Frames per chunk for chunked vertical attention (~320ms at 50Hz)")
-    parser.add_argument("--share_topdown_keys", action="store_true", default=True,
-                        help="Share W_K for bottom-up and top-down keys")
-    parser.add_argument("--no_share_topdown_keys", dest="share_topdown_keys",
-                        action="store_false")
+    parser.add_argument("--refine_num_heads", type=int, default=4,
+                        help="Number of attention heads in RefineLayer")
     
     # Data
     parser.add_argument("--data_dir", type=str, default=None,
@@ -240,23 +232,13 @@ def monitor_model(model, step, rank=0):
         "inhibition/lambda": m.inhibition.lambda_.item(),
     }
     
-    # Vertical attention entropy
-    for i, va in enumerate(m.vertical_attention):
-        w = va.attention_weights
+    # RefineLayer diagnostics: per-level gate value and attention entropy
+    for i, rl in enumerate(m.refine_layers):
+        diagnostics[f"refine/level_{i}_gate"] = rl.gate.item()
+        w = rl._last_attention_weights
         if w is not None:
-            # Handle both scalar (B, N) and per-token (B, T, N) weights
-            if w.dim() == 3:
-                entropy = -(w * (w + 1e-8).log()).sum(-1).mean().item()
-            else:
-                entropy = -(w * (w + 1e-8).log()).sum(-1).mean().item()
-            diagnostics[f"vertical_attn/block_{i}_entropy"] = entropy
-        
-        # Top-down attention diagnostics (chunked modes)
-        if hasattr(va, "attention_weights_topdown"):
-            w_td = va.attention_weights_topdown
-            if w_td is not None and w_td.numel() > 0:
-                td_mass = w_td.sum(-1).mean().item()
-                diagnostics[f"vertical_attn/block_{i}_td_mass"] = td_mass
+            entropy = -(w * (w + 1e-8).log()).sum(-1).mean().item()
+            diagnostics[f"refine/level_{i}_entropy"] = entropy
     
     return diagnostics
 
@@ -294,14 +276,11 @@ def train_stage(
             
             # Forward
             with torch.amp.autocast('cuda', enabled=args.fp16):
-                m = model.module if hasattr(model, "module") else model
-                use_chunked = m.vertical_attention_type in ("chunked", "chunked_per_token")
                 outputs = model(
                     input_values=input_values,
                     attention_mask=attention_mask,
                     labels=labels,
                     rank_reg_weight=args.rank_reg_weight,
-                    use_chunked=use_chunked,
                 )
                 loss = outputs["loss"] / args.accum_grad
             
@@ -429,18 +408,15 @@ def main():
     log("Building HPSN model...", rank)
     model = HPSNHubert(
         pretrained=args.pretrained,
-        query_dim=args.query_dim,
+        refine_num_heads=args.refine_num_heads,
         inhibition_rank=args.inhibition_rank,
         inhibition_boundary=args.inhibition_boundary,
-        vertical_attention_type=args.vertical_attention_type,
-        chunk_size=args.chunk_size,
-        share_topdown_keys=args.share_topdown_keys,
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
     novel_params = sum(
         p.numel() for n, p in model.named_parameters()
-        if any(x in n for x in ["vertical_attention", "inhibition", "ctc_head"])
+        if any(x in n for x in ["refine_layers", "inhibition", "ctc_head"])
     )
     log(f"Total params: {total_params:,} | Novel params: {novel_params:,} "
         f"({novel_params/total_params*100:.2f}%)", rank)
