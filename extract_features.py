@@ -1,14 +1,14 @@
 """
-Extract Block-Level Representations from HPSN
-==============================================
-Extracts representations from each block boundary for brain encoding
-evaluation (RSA, linear encoding models).
+Extract Block-Level Representations from HPSN (v2 Two-Pass)
+============================================================
+Extracts raw and refined representations from each block boundary
+for brain encoding evaluation (RSA, linear encoding models).
 
 Usage:
     python extract_features.py \
-        --checkpoint runs/hpsn_v1/stage2_best.pt \
+        --checkpoint runs/hpsn_v2/stage2_best.pt \
         --audio_dir /path/to/audio/files \
-        --output_dir features/hpsn_v1/
+        --output_dir features/hpsn_v2/
 """
 
 import argparse
@@ -36,8 +36,9 @@ def extract_block_features(
     
     Returns:
         dict with keys:
-            - block_0 through block_5: numpy arrays of shape (T_enc, 1024)
-            - attention_weights: list of (num_sources,) arrays
+            - raw_block_0 through raw_block_4: numpy arrays of shape (T_enc, 1024)
+            - refined_block_0 through refined_block_4: numpy arrays of shape (T_enc, 1024)
+            - refine_attention_weights: list of arrays
             - inhibition_effective_rank: float
     """
     # Load audio
@@ -60,13 +61,17 @@ def extract_block_features(
         )
     
     result = {}
-    for i, bo in enumerate(outputs["block_outputs"]):
-        result[f"block_{i}"] = bo.squeeze(0).cpu().numpy()  # (T, 1024)
+    for i, bo in enumerate(outputs["raw_block_outputs"]):
+        result[f"raw_block_{i}"] = bo.squeeze(0).cpu().numpy()  # (T, 1024)
+    
+    if outputs["refined_block_outputs"] is not None:
+        for i, ro in enumerate(outputs["refined_block_outputs"]):
+            result[f"refined_block_{i}"] = ro.squeeze(0).cpu().numpy()
     
     result["logits"] = outputs["logits"].squeeze(0).cpu().numpy()
-    result["attention_weights"] = [
+    result["refine_attention_weights"] = [
         w.squeeze(0).cpu().numpy() if w is not None else None
-        for w in outputs["attention_weights"]
+        for w in (outputs["refine_attention_weights"] or [])
     ]
     result["inhibition_effective_rank"] = outputs["inhibition_effective_rank"]
     
@@ -119,8 +124,8 @@ def main():
         np.savez_compressed(
             out_path,
             **{k: v for k, v in features.items() if isinstance(v, np.ndarray)},
-            attention_weights=np.array(
-                [w for w in features["attention_weights"] if w is not None], 
+            refine_attention_weights=np.array(
+                [w for w in features["refine_attention_weights"] if w is not None], 
                 dtype=object,
             ),
             inhibition_rank=np.array(features["inhibition_effective_rank"]),
