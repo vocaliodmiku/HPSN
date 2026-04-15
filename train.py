@@ -79,7 +79,15 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--rank_reg_weight", type=float, default=0.01)
-    
+    parser.add_argument("--denoise_std", type=float, default=0.0,
+                        help="Gaussian noise std for lower-level denoising (0=off)")
+    parser.add_argument("--denoise_weight", type=float, default=1.0,
+                        help="Weight for denoising loss (active when denoise_std>0)")
+    parser.add_argument("--sharpen_weight", type=float, default=0.0,
+                        help="Weight for contrastive sharpening loss (0=off)")
+    parser.add_argument("--sharpen_temp", type=float, default=0.1,
+                        help="Temperature for sharpening contrastive loss")
+
     # Logging / checkpointing
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--log_every", type=int, default=100)
@@ -256,6 +264,8 @@ def train_stage(
     step = 0
     epoch = 0
     accum_loss = 0.0
+    accum_denoise = 0.0
+    accum_sharpen = 0.0
     best_wer = float("inf")
     
     log(f"=== {stage_name}: {total_steps} steps, warmup={warmup_steps} ===", rank)
@@ -280,6 +290,10 @@ def train_stage(
                     attention_mask=attention_mask,
                     labels=labels,
                     rank_reg_weight=args.rank_reg_weight,
+                    denoise_std=args.denoise_std,
+                    denoise_weight=args.denoise_weight,
+                    sharpen_weight=args.sharpen_weight,
+                    sharpen_temp=args.sharpen_temp,
                 )
                 loss = outputs["loss"] / args.accum_grad
             
@@ -298,6 +312,8 @@ def train_stage(
                 loss.backward()
             
             accum_loss += outputs["loss"].item()  # track raw loss, not pre-divided
+            accum_denoise += outputs.get("denoise_loss", torch.zeros(1)).item()
+            accum_sharpen += outputs.get("sharpen_loss", torch.zeros(1)).item()
             
             # Optimizer step every accum_grad mini-batches
             if (step + 1) % args.accum_grad == 0 or step == total_steps - 1:
@@ -339,7 +355,12 @@ def train_stage(
                 avg_loss = accum_loss / args.log_every
                 current_lr = optimizer.param_groups[0]["lr"]
                 diag = monitor_model(model, step, rank)
-                
+
+                if args.denoise_std > 0:
+                    diag["denoise_loss"] = accum_denoise / args.log_every
+                if args.sharpen_weight > 0:
+                    diag["sharpen_loss"] = accum_sharpen / args.log_every
+
                 diag_str = " | ".join(f"{k}: {v:.4f}" for k, v in diag.items())
                 log(
                     f"{stage_name} step {step}/{total_steps} | "
@@ -347,6 +368,8 @@ def train_stage(
                     rank,
                 )
                 accum_loss = 0.0
+                accum_denoise = 0.0
+                accum_sharpen = 0.0
             
             # Evaluation
             if step % args.eval_every == 0:

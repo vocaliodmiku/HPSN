@@ -12,6 +12,7 @@ Two-pass architecture:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import HubertForCTC, HubertConfig
 from modules import RefineLayer, SubspaceInhibition
 
@@ -147,6 +148,10 @@ class HPSNHubert(nn.Module):
         return_block_outputs: bool = False,   # for analysis / RSA
         bypass_novel: bool = False,           # skip Pass 2 (pretrained baseline eval)
         rank_reg_weight: float = 0.01,
+        denoise_std: float = 0.0,            # noise std for lower-level denoising
+        denoise_weight: float = 0.0,         # weight for denoising loss
+        sharpen_weight: float = 0.0,         # weight for contrastive sharpening loss
+        sharpen_temp: float = 0.1,           # temperature for sharpening loss
     ):
         """
         Two-pass forward.
@@ -219,29 +224,38 @@ class HPSNHubert(nn.Module):
         # For the refinement, we use indices 1..5 (the 5 block outputs)
         # to align with the paper notation where o_b = output of block b.
 
+        clean_targets = {}
+        pre_inhib = None
+        post_inhib = None
+
         if bypass_novel:
             # Use raw output of last block directly
             final_hidden = raw_block_outputs[-1]
+            refined = None
         else:
             # ============================================================
             # Pass 2: Sequential refinement with full-context access
             # ============================================================
-            # We refine the 5 block outputs (indices 1..5 in raw_block_outputs).
-            # o[b] = raw_block_outputs[b+1] for b = 0..4
             num_levels = self.num_blocks  # 5
             o = [raw_block_outputs[i + 1] for i in range(num_levels)]
 
-            refined = []  # will accumulate r0, r1, ...
+            # Inject noise into lower (acoustic) levels during training
+            # to force top-down refinement to actively denoise
+            if denoise_std > 0 and self.training:
+                for lvl in (0, 1):
+                    clean_targets[lvl] = o[lvl]  # save reference before corruption
+                    o[lvl] = o[lvl] + torch.randn_like(o[lvl]) * denoise_std
+
+            refined = []
             for b in range(num_levels):
-                # Build context: [r0, ..., r_{b-1}, o_b, o_{b+1}, ..., o_{N-1}]
                 context = list(refined) + o[b:]
 
-                # Apply inhibition to query if at designated boundary
                 query = o[b]
                 if b == self.inhibition_boundary:
+                    pre_inhib = query
                     query = self.inhibition(query)
+                    post_inhib = query
 
-                # Refine
                 r_b = self.refine_layers[b](query=query, context_list=context)
                 refined.append(r_b)
 
@@ -279,10 +293,34 @@ class HPSNHubert(nn.Module):
             )
 
             rank_loss = self.inhibition.rank_regularization()
+            total_loss = ctc_loss + rank_reg_weight * rank_loss
 
-            result["loss"] = ctc_loss + rank_reg_weight * rank_loss
+            # Denoising loss: refined levels should recover clean representations
+            denoise_loss = torch.tensor(0.0, device=logits.device)
+            if clean_targets and denoise_weight > 0 and refined is not None:
+                for lvl, clean in clean_targets.items():
+                    denoise_loss = denoise_loss + F.mse_loss(refined[lvl], clean)
+                denoise_loss = denoise_loss / len(clean_targets)
+                total_loss = total_loss + denoise_weight * denoise_loss
+
+            # Sharpening loss: post-inhibition features should cluster by phoneme
+            sharpen_loss = torch.tensor(0.0, device=logits.device)
+            if sharpen_weight > 0 and post_inhib is not None:
+                with torch.no_grad():
+                    pt_hidden = raw_block_outputs[-1]
+                    if self.config.do_stable_layer_norm:
+                        pt_hidden = self.encoder_layer_norm(pt_hidden)
+                    pseudo_labels = self.ctc_head(pt_hidden).argmax(dim=-1)
+                sharpen_loss = self._compute_sharpen_loss(
+                    post_inhib, pseudo_labels, sharpen_temp,
+                )
+                total_loss = total_loss + sharpen_weight * sharpen_loss
+
+            result["loss"] = total_loss
             result["ctc_loss"] = ctc_loss.detach()
             result["rank_loss"] = rank_loss.detach()
+            result["denoise_loss"] = denoise_loss.detach()
+            result["sharpen_loss"] = sharpen_loss.detach()
 
         if return_block_outputs:
             result["raw_block_outputs"] = raw_block_outputs
@@ -293,6 +331,57 @@ class HPSNHubert(nn.Module):
             result["inhibition_effective_rank"] = self.inhibition.effective_rank
 
         return result
+
+    def _compute_sharpen_loss(
+        self, post_inhib, pseudo_labels, temperature=0.1, max_samples=512,
+    ):
+        """
+        Supervised contrastive loss: post-inhibition features should cluster
+        by phoneme identity (from CTC pseudo-labels).
+
+        Uses SupCon (Khosla et al. 2020): for each anchor frame, maximize
+        log-probability of same-label frames relative to all other frames.
+        """
+        B, T, D = post_inhib.shape
+        feats = post_inhib.reshape(B * T, D)
+        labs = pseudo_labels.reshape(B * T)
+
+        # Filter out CTC blank frames (id=0)
+        mask = labs != 0
+        feats = feats[mask]
+        labs = labs[mask]
+
+        if feats.shape[0] < 10 or labs.unique().numel() < 2:
+            return torch.tensor(0.0, device=post_inhib.device)
+
+        # Subsample for memory efficiency
+        N = min(feats.shape[0], max_samples)
+        if feats.shape[0] > N:
+            idx = torch.randperm(feats.shape[0], device=feats.device)[:N]
+            feats = feats[idx]
+            labs = labs[idx]
+
+        feats = F.normalize(feats, dim=-1)
+        sim = feats @ feats.T / temperature  # (N, N)
+
+        # Positive mask: same label, exclude self
+        pos_mask = (labs.unsqueeze(0) == labs.unsqueeze(1)).float()
+        self_mask = torch.eye(N, device=feats.device)
+        pos_mask = pos_mask * (1 - self_mask)
+
+        # Numerically stable log-softmax over all non-self entries
+        sim_max = sim.detach().max(dim=1, keepdim=True).values
+        exp_sim = torch.exp(sim - sim_max) * (1 - self_mask)
+        log_prob = (sim - sim_max) - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Average log-probability over positive pairs per anchor
+        pos_count = pos_mask.sum(dim=1)
+        valid = pos_count > 0
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=post_inhib.device)
+
+        loss = -(pos_mask * log_prob).sum(dim=1)[valid] / pos_count[valid]
+        return loss.mean()
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
         """Compute output lengths after CNN feature extractor."""
