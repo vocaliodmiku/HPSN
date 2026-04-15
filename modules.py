@@ -40,8 +40,10 @@ class RefineLayer(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             hidden_dim, num_heads, batch_first=True,
         )
-        # Gate initialized near zero: sigmoid(-5) ≈ 0.007
-        self.log_gate = nn.Parameter(torch.tensor(-5.0))
+        # Gate initialized so refinement participates from the start.
+        # sigmoid(-1) ≈ 0.27 — large enough for meaningful gradient flow,
+        # small enough that the pretrained signal still dominates early on.
+        self.log_gate = nn.Parameter(torch.tensor(-1.0))
 
         # For logging / analysis
         self._last_attention_weights = None
@@ -120,7 +122,7 @@ class SubspaceInhibition(nn.Module):
         hidden_dim: int = 1024, 
         rank: int = 64,
         tau_init: float = 1.0,
-        lambda_init: float = 0.01,
+        lambda_init: float = 0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -167,7 +169,7 @@ class SubspaceInhibition(nn.Module):
         
         return inhibited
     
-    def rank_regularization(self, r_min: float = 5.0, r_max: float = 50.0) -> torch.Tensor:
+    def rank_regularization(self, r_min: float = 15.0, r_max: float = 50.0) -> torch.Tensor:
         """
         Effective rank regularization for P using participation ratio.
         Penalizes if effective rank is outside [r_min, r_max].
