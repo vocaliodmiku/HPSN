@@ -77,7 +77,7 @@ def load_and_preprocess_meg(meg_con_path, l_freq=0.5, h_freq=30.0, resample_freq
     """
     raw = mne.io.read_raw_kit(meg_con_path, preload=True)
     raw.pick_types(meg=True, ref_meg=False, misc=False, stim=False)
-    raw.filter(l_freq=l_freq, h_freq=h_freq, n_jobs=1)
+    raw.filter(l_freq=l_freq, h_freq=h_freq, n_jobs=-1)
     if resample_freq and raw.info["sfreq"] != resample_freq:
         raw.resample(resample_freq, npad="auto")
     return raw
@@ -166,13 +166,14 @@ def epoch_meg_around_words(raw, word_events, tmin=-0.2, tmax=0.8):
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
-def extract_story_features(model, processor, audio_path, device):
+def extract_story_features(model, processor, audio_path, device,
+                           bypass_novel=False):
     """
     Extract block-level features from HPSN for one audio file.
 
     Returns:
         raw_features: list of 5 arrays, each (T_enc, D)
-        refined_features: list of 5 arrays, each (T_enc, D)
+        refined_features: list of 5 arrays, each (T_enc, D) (None if bypass)
         frame_times: array of (T_enc,) — time in seconds for each frame
     """
     waveform, sr = torchaudio.load(audio_path)
@@ -185,15 +186,18 @@ def extract_story_features(model, processor, audio_path, device):
     out = model(
         input_values=waveform.to(device),
         return_block_outputs=True,
-        bypass_novel=False,
+        bypass_novel=bypass_novel,
     )
 
     raw = out["raw_block_outputs"]       # [o_feat, o_b0, ..., o_b4]
-    refined = out["refined_block_outputs"]  # [r0, ..., r4]
+    refined = out["refined_block_outputs"]  # [r0, ..., r4] or None
 
     num_levels = model.num_blocks
     raw_feats = [raw[b + 1][0].cpu().float().numpy() for b in range(num_levels)]
-    ref_feats = [refined[b][0].cpu().float().numpy() for b in range(num_levels)]
+    if refined is not None:
+        ref_feats = [refined[b][0].cpu().float().numpy() for b in range(num_levels)]
+    else:
+        ref_feats = None
 
     # HuBERT frame rate: ~20ms per frame (50 Hz)
     T_enc = raw_feats[0].shape[0]
@@ -249,7 +253,7 @@ def run_linear_encoding(
         results: dict of {level_name: {mean_r, per_sensor_r, per_time_r}}
     """
     if alphas is None:
-        alphas = np.logspace(-1, 6, 20)
+        alphas = np.logspace(0, 5, 8)
 
     N_words, N_sensors, N_times = meg_data.shape
     results = {}
@@ -363,6 +367,48 @@ def run_hierarchical_rsa(
             rsa_results[name].append(float(rho))
 
     return rsa_results, time_centers
+
+
+def compute_rsa_noise_ceiling(meg_data, epoch_times, window_size_ms=50,
+                              step_ms=10, sfreq=200):
+    """
+    Split-half noise ceiling for neural RDMs.
+
+    Splits words into odd/even, computes neural RDMs for each half at each
+    time window, and returns Spearman correlation between the two halves.
+    This gives the maximum achievable RSA for any model.
+
+    Returns:
+        noise_ceiling: list of floats (one per time window)
+        time_centers: list of floats
+    """
+    N_words, N_sensors, N_times = meg_data.shape
+    window_samples = int(window_size_ms / 1000 * sfreq)
+    step_samples = int(step_ms / 1000 * sfreq)
+
+    odd_idx = np.arange(0, N_words, 2)
+    even_idx = np.arange(1, N_words, 2)
+    n_min = min(len(odd_idx), len(even_idx))
+    odd_idx, even_idx = odd_idx[:n_min], even_idx[:n_min]
+
+    time_centers = []
+    ceiling = []
+
+    for start in range(0, N_times - window_samples, step_samples):
+        end = start + window_samples
+        t_center = epoch_times[start + window_samples // 2]
+        time_centers.append(float(t_center))
+
+        window_odd = meg_data[odd_idx, :, start:end].reshape(n_min, -1)
+        window_even = meg_data[even_idx, :, start:end].reshape(n_min, -1)
+
+        rdm_odd = rdm_upper_tri(compute_rdm(window_odd))
+        rdm_even = rdm_upper_tri(compute_rdm(window_even))
+
+        rho, _ = stats.spearmanr(rdm_odd, rdm_even)
+        ceiling.append(float(rho))
+
+    return ceiling, time_centers
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +530,8 @@ def process_one_run(
     sub, ses, task_id,
     tmin=-0.2, tmax=0.8,
     max_words=300,
+    bypass_novel=False,
+    audio_feature_cache=None,
 ):
     """
     Process one MEG run: preprocess, extract features, align.
@@ -525,8 +573,8 @@ def process_one_run(
         logger.warning(f"  No valid epochs for {sub_str}/{ses_str}/{task_id}")
         return None
 
-    # Limit words for memory
-    if len(valid_events) > max_words:
+    # Limit words for memory (0 = no limit)
+    if max_words > 0 and len(valid_events) > max_words:
         valid_events = valid_events[:max_words]
         epochs = epochs[:max_words]
 
@@ -535,25 +583,48 @@ def process_one_run(
     del epochs
 
     # 4. Extract features for each unique audio file in this run
-    audio_to_feats = {}
+    if audio_feature_cache is None:
+        audio_feature_cache = {}
+    audio_to_feats = audio_feature_cache
+    # Build case-insensitive lookup for audio directory once
+    audio_dir = Path(meg_dir) / "stimuli" / "audio"
+    _audio_lower_map = {}
+    if audio_dir.exists():
+        for f in audio_dir.iterdir():
+            _audio_lower_map[f.name.lower()] = f
+
     for ev in valid_events:
         sound = ev["sound"]
         if sound not in audio_to_feats:
             audio_path = Path(meg_dir) / sound
             if not audio_path.exists():
-                audio_path = Path(meg_dir) / "stimuli" / "audio" / Path(sound).name
+                audio_path = audio_dir / Path(sound).name
+            # Case-insensitive fallback (events.tsv uses CamelCase,
+            # files on disk are lowercase)
+            if not audio_path.exists():
+                lower = Path(sound).name.lower()
+                if lower in _audio_lower_map:
+                    audio_path = _audio_lower_map[lower]
             if audio_path.exists():
                 raw_f, ref_f, ftimes = extract_story_features(
                     model, processor, str(audio_path), device,
+                    bypass_novel=bypass_novel,
                 )
                 audio_to_feats[sound] = (raw_f, ref_f, ftimes)
             else:
                 logger.warning(f"  Audio not found: {sound}")
 
+    # Log audio extraction summary
+    unique_sounds = set(ev["sound"] for ev in valid_events)
+    found = sum(1 for s in unique_sounds if s in audio_to_feats)
+    logger.info(f"  Audio: {found}/{len(unique_sounds)} unique files found, "
+                f"{len(valid_events)} word events")
+
     # 5. Align: get word-level features using start_in_audio
     num_levels = model.num_blocks
+    has_refined = not bypass_novel
     raw_word_feats = [[] for _ in range(num_levels)]
-    ref_word_feats = [[] for _ in range(num_levels)]
+    ref_word_feats = [[] for _ in range(num_levels)] if has_refined else None
     keep_mask = []
 
     for ev in valid_events:
@@ -570,9 +641,10 @@ def process_one_run(
             raw_word_feats[b].append(
                 align_features_to_word(raw_f[b], ftimes, word_onset, word_dur)
             )
-            ref_word_feats[b].append(
-                align_features_to_word(ref_f[b], ftimes, word_onset, word_dur)
-            )
+            if has_refined:
+                ref_word_feats[b].append(
+                    align_features_to_word(ref_f[b], ftimes, word_onset, word_dur)
+                )
 
         keep_mask.append(True)
 
@@ -586,7 +658,8 @@ def process_one_run(
     model_features = {}
     for b in range(num_levels):
         model_features[f"raw_level_{b}"] = np.stack(raw_word_feats[b])
-        model_features[f"refined_level_{b}"] = np.stack(ref_word_feats[b])
+        if has_refined:
+            model_features[f"refined_level_{b}"] = np.stack(ref_word_feats[b])
 
     return {
         "meg_data": meg_data,
@@ -611,8 +684,8 @@ def parse_args():
                    help="Subject numbers to process (default: all 1-27)")
     p.add_argument("--sessions", nargs="+", type=int, default=None,
                    help="Session numbers (default: 0 and 1)")
-    p.add_argument("--max_words", type=int, default=300,
-                   help="Max word events per run")
+    p.add_argument("--max_words", type=int, default=0,
+                   help="Max word events per run (0=no limit)")
     p.add_argument("--tmin", type=float, default=-0.2)
     p.add_argument("--tmax", type=float, default=0.8)
     # Model config
@@ -624,6 +697,8 @@ def parse_args():
                    help="Skip Track A (linear encoding)")
     p.add_argument("--skip_rsa", action="store_true",
                    help="Skip Track B (hierarchical RSA)")
+    p.add_argument("--bypass_novel", action="store_true",
+                   help="Skip HPSN refinement (evaluate pretrained HuBERT baseline)")
     p.add_argument(
         "--log_level",
         type=str,
@@ -685,6 +760,7 @@ def main():
     all_encoding_results = []
     all_rsa_results = []
     all_n400_results = []
+    audio_feature_cache = {}  # cache audio features across all subjects/sessions
 
     for sub in args.subjects:
         for ses in args.sessions:
@@ -707,6 +783,8 @@ def main():
                     sub, ses, task_id,
                     tmin=args.tmin, tmax=args.tmax,
                     max_words=args.max_words,
+                    bypass_novel=args.bypass_novel,
+                    audio_feature_cache=audio_feature_cache,
                 )
 
                 if result is None:
@@ -735,11 +813,15 @@ def main():
                     rsa_results, time_centers = run_hierarchical_rsa(
                         feats, meg_data, epoch_times,
                     )
+                    noise_ceiling, _ = compute_rsa_noise_ceiling(
+                        meg_data, epoch_times,
+                    )
                     all_rsa_results.append({
                         "run_id": run_id,
                         "n_words": N_words,
                         "time_centers": time_centers,
                         "rsa": rsa_results,
+                        "noise_ceiling": noise_ceiling,
                     })
 
                     # Find peak time for each level
@@ -749,10 +831,10 @@ def main():
                         peak_rho = rho_values[peak_idx]
                         logger.debug(f"    {name}: peak rho={peak_rho:.4f} at t={peak_time:.3f}s")
 
-                # Track C: N400 at inhibition boundary
-                logger.info(f"  Track C: N400 analysis")
+                # Track C: N400 at inhibition boundary (skip in bypass mode)
                 b = model.inhibition_boundary
-                if f"raw_level_{b}" in feats:
+                if not args.bypass_novel and f"raw_level_{b}" in feats:
+                    logger.info(f"  Track C: N400 analysis")
                     # Use raw and apply inhibition manually
                     # Pre = raw at boundary, Post = inhibited
                     pre_feats = feats[f"raw_level_{b}"]
@@ -821,6 +903,18 @@ def main():
         aggregate["rsa"] = {k: {"mean_peak_time": v["mean_peak_time"],
                                  "mean_peak_rho": v["mean_peak_rho"]}
                             for k, v in rsa_summary.items()}
+
+        # Noise ceiling summary
+        all_ceilings = [r["noise_ceiling"] for r in all_rsa_results
+                        if "noise_ceiling" in r]
+        if all_ceilings:
+            mean_ceiling = np.mean(all_ceilings, axis=0)
+            peak_ceil = float(np.max(mean_ceiling))
+            mean_ceil = float(np.mean(mean_ceiling))
+            aggregate["rsa_noise_ceiling"] = {
+                "peak": peak_ceil, "mean": mean_ceil,
+            }
+            logger.info(f"  Noise ceiling: peak={peak_ceil:.4f}, mean={mean_ceil:.4f}")
 
     # Track C summary
     if all_n400_results:
