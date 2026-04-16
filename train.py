@@ -78,7 +78,7 @@ def parse_args():
                         help="Gradient accumulation steps")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--rank_reg_weight", type=float, default=0.01)
+    parser.add_argument("--rank_reg_weight", type=float, default=0.1)
     parser.add_argument("--denoise_std", type=float, default=0.0,
                         help="Gaussian noise std for lower-level denoising (0=off)")
     parser.add_argument("--denoise_weight", type=float, default=1.0,
@@ -87,6 +87,10 @@ def parse_args():
                         help="Weight for contrastive sharpening loss (0=off)")
     parser.add_argument("--sharpen_temp", type=float, default=0.1,
                         help="Temperature for sharpening contrastive loss")
+    parser.add_argument("--cpc_weight", type=float, default=0.0,
+                        help="Weight for inter-level CPC loss (0=off)")
+    parser.add_argument("--cpc_temp", type=float, default=0.1,
+                        help="Temperature for CPC InfoNCE loss")
 
     # Logging / checkpointing
     parser.add_argument("--output_dir", type=str, required=True)
@@ -266,6 +270,7 @@ def train_stage(
     accum_loss = 0.0
     accum_denoise = 0.0
     accum_sharpen = 0.0
+    accum_cpc = 0.0
     best_wer = float("inf")
     
     log(f"=== {stage_name}: {total_steps} steps, warmup={warmup_steps} ===", rank)
@@ -294,6 +299,8 @@ def train_stage(
                     denoise_weight=args.denoise_weight,
                     sharpen_weight=args.sharpen_weight,
                     sharpen_temp=args.sharpen_temp,
+                    cpc_weight=args.cpc_weight,
+                    cpc_temp=args.cpc_temp,
                 )
                 loss = outputs["loss"] / args.accum_grad
             
@@ -314,6 +321,7 @@ def train_stage(
             accum_loss += outputs["loss"].item()  # track raw loss, not pre-divided
             accum_denoise += outputs.get("denoise_loss", torch.zeros(1)).item()
             accum_sharpen += outputs.get("sharpen_loss", torch.zeros(1)).item()
+            accum_cpc += outputs.get("cpc_loss", torch.zeros(1)).item()
             
             # Optimizer step every accum_grad mini-batches
             if (step + 1) % args.accum_grad == 0 or step == total_steps - 1:
@@ -360,6 +368,8 @@ def train_stage(
                     diag["denoise_loss"] = accum_denoise / args.log_every
                 if args.sharpen_weight > 0:
                     diag["sharpen_loss"] = accum_sharpen / args.log_every
+                if args.cpc_weight > 0:
+                    diag["cpc_loss"] = accum_cpc / args.log_every
 
                 diag_str = " | ".join(f"{k}: {v:.4f}" for k, v in diag.items())
                 log(
@@ -370,6 +380,7 @@ def train_stage(
                 accum_loss = 0.0
                 accum_denoise = 0.0
                 accum_sharpen = 0.0
+                accum_cpc = 0.0
             
             # Evaluation
             if step % args.eval_every == 0:
@@ -438,7 +449,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     novel_params = sum(
         p.numel() for n, p in model.named_parameters()
-        if any(x in n for x in ["refine_layers", "inhibition", "ctc_head"])
+        if any(x in n for x in ["refine_layers", "inhibition", "ctc_head", "cpc_projections"])
     )
     log(f"Total params: {total_params:,} | Novel params: {novel_params:,} "
         f"({novel_params/total_params*100:.2f}%)", rank)

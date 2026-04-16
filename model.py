@@ -110,6 +110,17 @@ class HPSNHubert(nn.Module):
             hidden_dim=self.hidden_dim,
             rank=inhibition_rank,
         )
+
+        # Inter-level CPC projection heads: refined[b+1] predicts raw[b]
+        # 4 pairs: (r1→o0), (r2→o1), (r3→o2), (r4→o3)
+        self.cpc_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            for _ in range(num_levels - 1)
+        ])
         
         # CTC head: keep the pretrained one (already set above as hubert.lm_head)
         # self.ctc_head is already assigned on line 67
@@ -152,6 +163,8 @@ class HPSNHubert(nn.Module):
         denoise_weight: float = 0.0,         # weight for denoising loss
         sharpen_weight: float = 0.0,         # weight for contrastive sharpening loss
         sharpen_temp: float = 0.1,           # temperature for sharpening loss
+        cpc_weight: float = 0.0,            # weight for inter-level CPC loss
+        cpc_temp: float = 0.1,              # temperature for CPC InfoNCE
     ):
         """
         Two-pass forward.
@@ -316,11 +329,18 @@ class HPSNHubert(nn.Module):
                 )
                 total_loss = total_loss + sharpen_weight * sharpen_loss
 
+            # Inter-level CPC loss: refined[b+1] predicts raw[b] via InfoNCE
+            cpc_loss = torch.tensor(0.0, device=logits.device)
+            if cpc_weight > 0 and refined is not None:
+                cpc_loss = self._compute_cpc_loss(refined, o, cpc_temp)
+                total_loss = total_loss + cpc_weight * cpc_loss
+
             result["loss"] = total_loss
             result["ctc_loss"] = ctc_loss.detach()
             result["rank_loss"] = rank_loss.detach()
             result["denoise_loss"] = denoise_loss.detach()
             result["sharpen_loss"] = sharpen_loss.detach()
+            result["cpc_loss"] = cpc_loss.detach()
 
         if return_block_outputs:
             result["raw_block_outputs"] = raw_block_outputs
@@ -383,6 +403,69 @@ class HPSNHubert(nn.Module):
         loss = -(pos_mask * log_prob).sum(dim=1)[valid] / pos_count[valid]
         return loss.mean()
 
+    def _compute_cpc_loss(
+        self, refined, raw_levels, temperature=0.1, max_frames=512,
+    ):
+        """
+        Inter-level contrastive predictive coding loss.
+
+        For each adjacent pair (b, b+1), refined[b+1] generates a prediction
+        of raw_levels[b] via a learned projection head. InfoNCE contrastive
+        loss encourages the prediction to be closer to the true target frame
+        than to other time-step frames (negative samples).
+
+        L_b = -log( exp(sim(pred_t, target_t)/tau) / sum_k exp(sim(pred_t, target_k)/tau) )
+
+        This is the neural analogue of predictive coding: higher cortical
+        areas predict the activity of lower areas, and the prediction error
+        drives learning.
+
+        Args:
+            refined: list of 5 tensors, each (B, T, D) — refined block outputs
+            raw_levels: list of 5 tensors, each (B, T, D) — raw block outputs (o)
+            temperature: InfoNCE temperature
+            max_frames: subsample frames for memory efficiency
+        Returns:
+            scalar loss averaged over all pairs
+        """
+        total_loss = torch.tensor(0.0, device=refined[0].device)
+        num_pairs = 0
+
+        # 4 pairs: refined[1]→raw[0], refined[2]→raw[1], refined[3]→raw[2], refined[4]→raw[3]
+        for b in range(len(refined) - 1):
+            proj = self.cpc_projections[b]
+            pred = proj(refined[b + 1])      # (B, T, D) — prediction of raw[b]
+            target = raw_levels[b].detach()   # (B, T, D) — raw target (no grad)
+
+            B, T, D = pred.shape
+
+            # Flatten batch and time
+            pred_flat = pred.reshape(B * T, D)
+            target_flat = target.reshape(B * T, D)
+
+            # Subsample for memory efficiency (N x N similarity matrix)
+            N = min(pred_flat.shape[0], max_frames)
+            if pred_flat.shape[0] > N:
+                idx = torch.randperm(pred_flat.shape[0], device=pred.device)[:N]
+                pred_flat = pred_flat[idx]
+                target_flat = target_flat[idx]
+
+            # L2-normalize for cosine similarity
+            pred_norm = F.normalize(pred_flat, dim=-1)
+            target_norm = F.normalize(target_flat, dim=-1)
+
+            # Similarity matrix: (N, N) — pred[i] vs target[j]
+            sim = pred_norm @ target_norm.T / temperature  # (N, N)
+
+            # InfoNCE: each row's diagonal is the positive, rest are negatives
+            labels = torch.arange(N, device=sim.device)
+            pair_loss = F.cross_entropy(sim, labels)
+
+            total_loss = total_loss + pair_loss
+            num_pairs += 1
+
+        return total_loss / max(num_pairs, 1)
+
     def _get_feat_extract_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
         """Compute output lengths after CNN feature extractor."""
         # HuBERT CNN: kernel_sizes=[10,3,3,3,3,2,2], strides=[5,2,2,2,2,2,2]
@@ -423,7 +506,7 @@ class HPSNHubert(nn.Module):
         backbone_params = []
         novel_params = []
         
-        novel_module_names = {"refine_layers", "inhibition", "ctc_head"}
+        novel_module_names = {"refine_layers", "inhibition", "ctc_head", "cpc_projections"}
         
         for name, param in self.named_parameters():
             if not param.requires_grad:
@@ -441,7 +524,7 @@ class HPSNHubert(nn.Module):
     def freeze_backbone(self):
         """Freeze all pretrained parameters (for Stage 1 training)."""
         for name, param in self.named_parameters():
-            if "refine_layers" in name or "inhibition" in name or "ctc_head" in name:
+            if "refine_layers" in name or "inhibition" in name or "ctc_head" in name or "cpc_projections" in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
