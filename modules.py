@@ -91,8 +91,9 @@ class RefineLayer(nn.Module):
                 # Average over heads and query positions → (B, N)
                 self._last_attention_weights = block_mass.mean(dim=1).mean(dim=1)
 
-        # Gated residual
-        return query + self.gate * attn_out
+        # Gated residual (clamp minimum to prevent gate collapse)
+        gate = torch.clamp(self.gate, min=0.1)
+        return query + gate * attn_out
 
 
 class SubspaceInhibition(nn.Module):
